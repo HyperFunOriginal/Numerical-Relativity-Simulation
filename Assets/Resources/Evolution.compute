@@ -1,0 +1,232 @@
+#pragma kernel WK
+#pragma kernel YAij
+#pragma kernel cGi
+#pragma kernel ConstraintDamp
+#pragma kernel Transfer
+
+#include "BSSNHelp.hlsl"
+StructuredBuffer<Voxel> old;
+StructuredBuffer<Voxel> current;
+RWStructuredBuffer<Voxel> next;
+
+StructuredBuffer<f4Comp> MassCurrent;
+StructuredBuffer<Sf3x3Comp> SpatialStress;
+
+StructuredBuffer<CompScalarVectorDerivs> sVs;
+StructuredBuffer<CompTensorDerivs> Ts;
+
+StructuredBuffer<CompressedChristoffel> raised;
+StructuredBuffer<CompressedChristoffel> lowered;
+StructuredBuffer<CompDerivedConstants> derived;
+
+#define kappa1 1. // gi
+#define kappa2 .1 // H; K
+#define kappa3 .11 // Mi; Aij
+#define kappa4 .8 // BG; Yij
+#define kappa5 .06 // DG; Yij
+#define kappa6 .1 // H; W
+#define kappa7 .1 // H; Aij
+
+// MassCurrent
+// SpatialStress
+// derived
+// sVs
+// old
+// next
+// current
+[numthreads(16, 8, 8)]
+void WK(uint3 id : SV_DispatchThreadID)
+{
+    Voxel v = current[Idx(id)];
+    CompScalarVectorDerivs derivs = sVs[Idx(id)];
+    CompDerivedConstants consts = derived[Idx(id)];
+    
+    float dtW = dot(derivs.delKAW.entries[2].toF3(), v.N.xyz) - v.W / 3. * Trace(derivs.delNi.toF3x3());
+    float dtK = dot(derivs.delKAW.entries[0].toF3(), v.N.xyz);
+    
+    if (!EdgeOfDomain(id, 4))
+    {
+        float3x3 cyuij = v.CYUij();
+        Sf3x3Comp spatial = SpatialStress[Idx(id)];
+        dtW += v.W / 3. * v.N.w * v.K;
+        dtK += v.K * v.K / 3. - Trace(consts.W2DmDnA.toF3x3(), cyuij) - v.N.w * vacuumEnergy + v.N.w * (SelfTraceSymmetric(v.Aij.toF3x3(), cyuij) + 4. * Pi * (Trace(spatial.toF3x3(), cyuij) * v.W * v.W + MassCurrent[Idx(id)].s));
+    
+         // Constraint Damping
+        dtW += kappa6 * consts.H * (v.W - consts.LaplW * 5.);
+        dtK -= v.N.w * v.K * consts.H * kappa2;
+    }
+    
+    next[Idx(id)].W = clamp(old[Idx(id)].W + dtW * timestep, 1E-4, 1E+4);
+    next[Idx(id)].K = old[Idx(id)].K + dtK * timestep;
+}
+
+// SpatialStress
+// derived
+// Ts
+// sVs
+// old
+// next
+// current
+[numthreads(8, 8, 9)]
+void YAij(uint3 id : SV_DispatchThreadID)
+{
+    Voxel v = current[Idx(id)];
+    CompScalarVectorDerivs derivs = sVs[Idx(id)];
+    CompTensorDerivs ds = Ts[Idx(id)];
+    
+    YijAijDerivatives dYA = ds.Decompress();
+    float3x3 dtYij = TensorWeightedLieDerivative(dYA.delYij, v.N.xyz, derivs.delNi.toF3x3(), v.cYij.toF3x3());
+    float3x3 dtAij = TensorWeightedLieDerivative(dYA.delAij, v.N.xyz, derivs.delNi.toF3x3(), v.Aij.toF3x3());
+    
+    if (!EdgeOfDomain(id, 4))
+    {
+        CompDerivedConstants consts = derived[Idx(id)];
+        DerivedConstants csts = consts.Decompress();
+        Sf3x3Comp spatial = SpatialStress[Idx(id)];
+        dtYij -= float(2. * v.N.w) * v.Aij.toF3x3();
+        dtAij += float(v.K * v.N.w) * v.Aij.toF3x3() + TraceFree(float(v.N.w) * (csts.W2Rij - 8. * Pi * spatial.toF3x3() * v.W * v.W) - csts.W2DmDnA, v.cYij.toF3x3()) - float(2. * v.N.w) * ContractBoth(v.CYUij(), v.Aij.toF3x3());
+    }
+    
+    next[Idx(id)].cYij.Set(old[Idx(id)].cYij.toF3x3() + dtYij * timestep);
+    next[Idx(id)].Aij.Set(old[Idx(id)].Aij.toF3x3() + dtAij * timestep);
+}
+
+// MassCurrent
+// raised
+// sVs
+// old
+// next
+// current
+
+[numthreads(13, 10, 5)]
+void cGi(uint3 id : SV_DispatchThreadID)
+{
+    Voxel v = current[Idx(id)];
+    CompScalarVectorDerivs derivs = sVs[Idx(id)];
+    
+    float3 dtGi = VectorWeightedLieDerivative(derivs.delGi.toF3x3(), v.N.xyz, derivs.delNi.toF3x3(), v.Gi);
+    float3x3 cYuij = v.CYUij();
+    float3 dB = 0;
+    if (!EdgeOfDomain(id, 4))
+    {
+        int3 origin = int3(id);
+        float3 ddx = 1. / CoordinateMetric(origin);
+        int3 offset = origin - clamp(origin - 3, 0, resolution - 7);
+    
+        float3x3 del = 0;
+        for (int j = 0; j < 7; j++)
+        {
+            f3x3Comp comp = sVs[Idx(int3(j + origin.x - offset.x, origin.y, origin.z))].delNi;
+            del += comp.toF3x3() * float(cdelO6[j + offset.x * 7] * ddx.x);
+        }
+        dtGi += cYuij[0][0] * del[0] + cYuij[0][1] * del[1] + cYuij[0][2] * del[2];
+        dB.x = Trace(del);
+    
+        del = 0;
+        for (j = 0; j < 7; j++)
+        {
+            f3x3Comp comp = sVs[Idx(int3(origin.x, j + origin.y - offset.y, origin.z))].delNi;
+            del += comp.toF3x3() * float(cdelO6[j + offset.y * 7] * ddx.y);
+        }
+        dtGi += cYuij[1][0] * del[0] + cYuij[1][1] * del[1] + cYuij[1][2] * del[2];
+        dB.y = Trace(del);
+    
+        del = 0;
+        for (j = 0; j < 7; j++)
+        {
+            f3x3Comp comp = sVs[Idx(int3(origin.x, origin.y, j + origin.z - offset.z))].delNi;
+            del += comp.toF3x3() * float(cdelO6[j + offset.z * 7] * ddx.z);
+        }
+        dtGi += cYuij[2][0] * del[0] + cYuij[2][1] * del[1] + cYuij[2][2] * del[2];
+        dB.z = Trace(del);
+    
+        dtGi += mul(cYuij, dB) / 3.;
+    
+        float3x3 AUij = ContractBoth(v.Aij.toF3x3(), cYuij);
+        {
+            dtGi -= mul(AUij, 6. * v.N.w * derivs.delKAW.entries[2].toF3() / v.W + 2. * derivs.delKAW.entries[1].toF3());
+            CompressedChristoffel chr = raised[Idx(id)];
+            dtGi.x += 2. * v.N.w * Trace(mul(chr.mn[0].toF3x3(), AUij));
+            dtGi.y += 2. * v.N.w * Trace(mul(chr.mn[1].toF3x3(), AUij));
+            dtGi.z += 2. * v.N.w * Trace(mul(chr.mn[2].toF3x3(), AUij));
+            dtGi -= 4. / 3. * v.N.w * mul(cYuij, derivs.delKAW.entries[0].toF3());
+        }
+    
+        f3Comp Ji = MassCurrent[Idx(id)].v;
+        dtGi -= 16. * Pi * v.N.w * mul(cYuij / (v.W * v.W), Ji.toF3());
+    }
+    
+    next[Idx(id)].Gi = old[Idx(id)].Gi + dtGi * timestep;
+}
+
+
+// raised
+// derived
+// sVs
+// next
+// current
+
+[numthreads(10, 8, 7)]
+void ConstraintDamp(uint3 id : SV_DispatchThreadID)
+{
+    //if (!EdgeOfDomain(id, 4))
+    {
+        float3x3 DiMj = 0;
+        float3x3 dtY = 0;
+        Voxel v = current[Idx(id)];
+    
+        CompScalarVectorDerivs del = sVs[Idx(id)];
+        float3 bI = del.delNi.toF3x3()._11_22_33;
+        float Bm2AK = (dot(bI, 1) - 2. * v.K * v.N.w) * 2. / 3.;
+    
+        CompDerivedConstants derivedConstants = derived[Idx(id)];
+        {
+            int3 origin = int3(id);
+            float3 ddx = 1. / CoordinateMetric(origin);
+            int3 offset = origin - clamp(origin - 3, 0, resolution - 7);
+    
+            for (int j = 0; j < 7; j++)
+            {
+                CompDerivedConstants comp1 = derived[Idx(int3(j + origin.x - offset.x, origin.y, origin.z))];
+                CompDerivedConstants comp2 = derived[Idx(int3(origin.x, j + origin.y - offset.y, origin.z))];
+                CompDerivedConstants comp3 = derived[Idx(int3(origin.x, origin.y, j + origin.z - offset.z))];
+                DiMj[0] += comp1.Mi.toF3() * float(cdelO6[j + offset.x * 7] * ddx.x);
+                DiMj[1] += comp2.Mi.toF3() * float(cdelO6[j + offset.y * 7] * ddx.y);
+                DiMj[2] += comp3.Mi.toF3() * float(cdelO6[j + offset.z * 7] * ddx.z);
+            
+                dtY[0] += comp1.Gi.toF3() * float(cdelO6[j + offset.x * 7] * ddx.x);
+                dtY[1] += comp2.Gi.toF3() * float(cdelO6[j + offset.y * 7] * ddx.y);
+                dtY[2] += comp3.Gi.toF3() * float(cdelO6[j + offset.z * 7] * ddx.z);
+            }
+        
+            CompressedChristoffel christoffelComp = raised[Idx(id)];
+            Christoffel uncomp = christoffelComp.Decompress();
+            DiMj = uncomp.CovariantDerivative(DiMj, derivedConstants.Mi.toF3(), true);
+            DiMj += 3. * TensorProduct(derivedConstants.Mi.toF3(), del.delKAW.entries[2].toF3() / max(.01, v.W));
+            dtY = mul(uncomp.CovariantDerivative(dtY, derivedConstants.Gi.toF3(), false), v.cYij.toF3x3());
+        
+            dtY *= -kappa5;
+            dtY += ContractBoth(TensorProduct(v.N.xyz, derivedConstants.Gi.toF3()), v.cYij.toF3x3()) * kappa4;
+            dtY -= float(0.2 * dot(derivedConstants.Gi.toF3(), mul(v.N.xyz, v.cYij.toF3x3()))) * v.cYij.toF3x3();
+        }
+    
+        float3 giScale = max(Bm2AK - bI - 0.4 * v.N.w * v.Aij.toF3x3()._11_22_33, 0);
+    
+        next[Idx(id)].Gi -= derivedConstants.Gi.toF3() * ((1. + kappa1) * giScale + Bm2AK) * timestep;
+        next[Idx(id)].Aij.TermwiseMADS(DiMj, timestep * v.N.w * kappa3);
+        next[Idx(id)].Aij.TermwiseMADS(v.Aij.toF3x3(), timestep * derivedConstants.H * v.N.w * kappa7);
+        next[Idx(id)].cYij.TermwiseMADS(dtY, timestep);
+    }
+}
+
+// transfer1
+// transfer2
+RWStructuredBuffer<Voxel> transfer1;
+RWStructuredBuffer<Voxel> transfer2;
+[numthreads(16, 8, 8)]
+void Transfer(uint3 id : SV_DispatchThreadID)
+{
+    cYijConstraint(transfer1[Idx(id)].cYij);
+    AijConstraint(transfer1[Idx(id)].Aij, transfer1[Idx(id)].cYij.toF3x3());
+    transfer2[Idx(id)] = transfer1[Idx(id)];
+}

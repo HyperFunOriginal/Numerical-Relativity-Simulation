@@ -1,0 +1,143 @@
+#pragma kernel EvolveSlicing
+#pragma kernel KreissOligerX
+#pragma kernel KreissOligerY
+#pragma kernel KreissOligerZ
+#pragma kernel SommerfeldRadiation
+#pragma kernel RenderToScreenSlice
+
+#include "BSSNHelp.hlsl"
+StructuredBuffer<Voxel> old;
+StructuredBuffer<Voxel> current;
+RWStructuredBuffer<Voxel> next;
+
+StructuredBuffer<f4Comp> MassCurrent;
+StructuredBuffer<Sf3x3Comp> SpatialStress;
+
+StructuredBuffer<CompScalarVectorDerivs> sVs;
+StructuredBuffer<CompTensorDerivs> Ts;
+
+StructuredBuffer<CompressedChristoffel> raised;
+StructuredBuffer<CompressedChristoffel> lowered;
+StructuredBuffer<CompDerivedConstants> derived;
+
+#define assert .75
+#define damp 0.06
+#define KO .195
+
+// current
+// sVs
+// next
+[numthreads(16,8,8)]
+void EvolveSlicing (uint3 id : SV_DispatchThreadID)
+{
+    bool boundary = EdgeOfDomain(id, 4);
+    Voxel v = current[Idx(id)];
+    
+    f3Comp delA = sVs[Idx(id)].delKAW.entries[1];
+    float4 boundaryFree = float4(v.Gi * assert - v.N.xyz * damp, dot(delA.toF3(), v.N.xyz) - 2. * v.N.w * v.K);
+    next[Idx(id)].N = clamp(old[Idx(id)].N + (boundary ? float4(0, 0, 0, dot(delA.toF3(), v.N.xyz)) : boundaryFree) * timestep, float4(-500, -500, -500, 1E-4), float4(500, 500, 500, 1.));
+}
+
+// current
+// next
+[numthreads(12, 10, 8)]
+void KreissOligerX(uint3 id : SV_DispatchThreadID)
+{
+    int3 origin = int3(id);
+    float ddx = timestep * 3. * KO / CoordinateMetric(origin).x;
+    int offset = origin.x - clamp(origin.x - 3, 0, resolution - 7);
+    
+    for (int j = 0; j < 7; j++)
+    {
+        Voxel comp = current[Idx(int3(j + origin.x - offset, origin.y, origin.z))];
+        next[Idx(id)].TermwiseMAD(comp, cdel6O2KO[j] * ddx);
+    }
+}
+[numthreads(12, 10, 8)]
+void KreissOligerY(uint3 id : SV_DispatchThreadID)
+{
+    int3 origin = int3(id);
+    float ddx = timestep * 3. * KO / CoordinateMetric(origin).y;
+    int offset = origin.y - clamp(origin.y - 3, 0, resolution - 7);
+    
+    for (int j = 0; j < 7; j++)
+    {
+        Voxel comp = current[Idx(int3(origin.x, j + origin.y - offset, origin.z))];
+        next[Idx(id)].TermwiseMAD(comp, cdel6O2KO[j] * ddx);
+    }
+}
+[numthreads(12, 10, 8)]
+void KreissOligerZ(uint3 id : SV_DispatchThreadID)
+{
+    int3 origin = int3(id);
+    float ddx = timestep * 3. * KO / CoordinateMetric(origin).z;
+    int offset = origin.z - clamp(origin.z - 3, 0, resolution - 7);
+    
+    for (int j = 0; j < 7; j++)
+    {
+        Voxel comp = current[Idx(int3(origin.x, origin.y, j + origin.z - offset))];
+        next[Idx(id)].TermwiseMAD(comp, cdel6O2KO[j] * ddx);
+    }
+}
+
+// current
+// next
+// sVs
+// Ts
+float3 ambientKAW;
+[numthreads(8, 8, 9)]
+void SommerfeldRadiation(uint3 id : SV_DispatchThreadID)
+{
+    if (!EdgeOfDomain(id, 4))
+        return;
+    
+    Voxel c = current[Idx(id)];
+    Voxel t = next[Idx(id)];
+    CompScalarVectorDerivs d1 = sVs[Idx(id)];
+    CompTensorDerivs d2 = Ts[Idx(id)];
+    
+    float3 position = CoordinateTransform(id);
+    float rinv = rsqrt(dot(position, position)) * timestep * ambientKAW.y;
+    
+    t.N.xyz -= (mul(position, d1.delNi.toF3x3()) + c.N.xyz * (1. + sqrt(length(c.N.xyz)))) * rinv;
+    t.Gi -= (mul(position, d1.delGi.toF3x3()) + c.Gi) * rinv;
+    
+    t.K -= (mul(position, d1.delKAW.entries[0].toF3()) + c.K - ambientKAW.x) * rinv;
+    t.N.w -= (mul(position, d1.delKAW.entries[1].toF3()) + c.N.w - ambientKAW.y) * rinv;
+    t.W -= (mul(position, d1.delKAW.entries[2].toF3()) + c.W - ambientKAW.z) * rinv;
+    
+    t.cYij.TermwiseMADS(d2.delYij[0].toF3x3() * float(position.x) + d2.delYij[1].toF3x3() * float(position.y) + d2.delYij[2].toF3x3() * float(position.z), -rinv);
+    t.Aij.TermwiseMADS(d2.delAij[0].toF3x3() * float(position.x) + d2.delAij[1].toF3x3() * float(position.y) + d2.delAij[2].toF3x3() * float(position.z), -rinv);
+    
+    t.cYij.TermwiseMADS(c.cYij.toF3x3() - I3, -rinv);
+    t.Aij.TermwiseMADS(c.Aij.toF3x3(), -rinv);
+    
+    // Ambient Evolution
+    t.W += timestep * ambientKAW.x * ambientKAW.y * c.W * .333333333333;
+    t.K += timestep * (ambientKAW.x * ambientKAW.x * .333333333333 - vacuumEnergy) * ambientKAW.y;
+    t.N.w -= timestep * c.N.w * ambientKAW.x * 2.;
+    
+    next[Idx(id)] = t;
+}
+
+RWTexture2D<float4> Result;
+[numthreads(32, 32, 1)]
+void RenderToScreenSlice(uint3 id : SV_DispatchThreadID)
+{
+    float3 position = float3(id.xy - resolution * 5., 0) * .35 * lengthScale;
+    int3 coords = int3(InverseCoordinateTransform(position));
+    position -= CoordinateTransform(coords);
+    
+    f3Comp dW = sVs[Idx(coords)].delKAW.entries[2];
+    f3x3Comp dN = sVs[Idx(coords)].delNi;
+    
+    float smoothLerpW = mul(position, dW.toF3());
+    float3 smoothLerpNi = mul(position, dN.toF3x3());
+    
+    float trueW = next[Idx(coords)].W + smoothLerpW;
+    float3 trueNi = smoothLerpNi + next[Idx(coords)].N.xyz;
+    
+    float3 display = smoothstep(0.75, 0.85, sin(log(abs(1. - trueW)) * 40.));
+    display = lerp(display, smoothstep(0.64, 0.66, trueW) * (0.6 + trueNi / sqrt(length(trueNi) + .01)), .94);
+    Result[id.xy] = float4(lerp(Result[id.xy].xyz, display, 1. - Result[id.xy].a * .7), 1);
+}

@@ -1,0 +1,77 @@
+#pragma kernel Initialize
+#pragma kernel InitKijAlphaU
+#pragma kernel ConstraintSolveBowenYork
+#include "InitialConditions.hlsl"
+
+RWStructuredBuffer<Voxel> old;
+RWStructuredBuffer<Voxel> current;
+RWStructuredBuffer<Voxel> next;
+
+RWStructuredBuffer<f4Comp> MassCurrent;
+RWStructuredBuffer<Sf3x3Comp> SpatialStress;
+
+RWStructuredBuffer<float> uBuffer;
+RWStructuredBuffer<float2> kAlphaBuffer; // Alpha; KijKuij
+
+[numthreads(16, 8, 8)]
+void InitKijAlphaU(uint3 id : SV_DispatchThreadID)
+{
+    uBuffer[Idx(id)] = 1;
+    
+    float3 position = CoordinateTransform(id);
+    float3x3 Kij = BowenYorkExtrinsicCurvature(position - position1, momentum1, spin1);
+    Kij += BowenYorkExtrinsicCurvature(position - position2, momentum2, spin2);
+    
+    kAlphaBuffer[Idx(id)] = float2(BowenYorkConformalFactor(position, position1, mass1) + BowenYorkConformalFactor(position, position2, mass2), Trace(mul(Kij, Kij)));
+}
+
+[numthreads(16, 8, 8)]
+void ConstraintSolveBowenYork(uint3 id : SV_DispatchThreadID)
+{
+    if (EdgeOfDomain(id, 1))
+        return;
+    
+    float2 temp = kAlphaBuffer[Idx(id)];
+    float u = uBuffer[Idx(id)];
+    
+    int3 origin = int3(id);
+    float3 ddx = 1. / CoordinateMetric(origin);
+    ddx *= ddx;
+    int3 offset = origin - clamp(origin - 3, 0, resolution - 7);
+    float lapl = 0;
+    
+    for (int j = 0; j < 7; j++)
+    {
+        lapl += uBuffer[Idx(int3(j + origin.x - offset.x, origin.y, origin.z))] * cdel2O6[j + offset.x * 7] * ddx.x;
+        lapl += uBuffer[Idx(int3(origin.x, j + origin.y - offset.y, origin.z))] * cdel2O6[j + offset.y * 7] * ddx.y;
+        lapl += uBuffer[Idx(int3(origin.x, origin.y, j + origin.z - offset.z))] * cdel2O6[j + offset.z * 7] * ddx.z;
+    }
+    
+    lapl += 0.125 * temp.y * pow(abs(temp.x + u), -7);
+    lapl /= dot(ddx, 1);
+    
+    uBuffer[Idx(id)] = clamp(u + lapl * .33, u * .5, u * 1.5);
+}
+
+[numthreads(16, 8, 8)]
+void Initialize (uint3 id : SV_DispatchThreadID)
+{
+    MassCurrent[Idx(id)].Set(0);
+    SpatialStress[Idx(id)].Set(0);
+
+    float3 position = CoordinateTransform(id);
+    float3x3 Kij = BowenYorkExtrinsicCurvature(position - position1, momentum1, spin1);
+    Kij += BowenYorkExtrinsicCurvature(position - position2, momentum2, spin2);
+    
+    Voxel init;
+    init.cYij.Set(I3);
+    init.W = pow(uBuffer[Idx(id)] + kAlphaBuffer[Idx(id)].x, -2);
+    init.N = float4(0,0,0,1);
+    init.K = 0;
+    init.Aij.Set(Kij * init.W * init.W * init.W);
+    init.Gi = 0;
+    
+    old[Idx(id)] = init;
+    current[Idx(id)] = init;
+    next[Idx(id)] = init;
+}

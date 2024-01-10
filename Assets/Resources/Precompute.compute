@@ -1,0 +1,126 @@
+#pragma kernel Derivatives
+#pragma kernel ComputeChristoffels
+#pragma kernel ComputeConformalRicci
+#pragma kernel ComputeDerived
+#pragma kernel ComputeDerived2
+
+#include "BSSNHelp.hlsl"
+StructuredBuffer<Voxel> current;
+StructuredBuffer<f4Comp> MassCurrent;
+
+RWStructuredBuffer<CompScalarVectorDerivs> sVs;
+RWStructuredBuffer<CompTensorDerivs> Ts;
+
+RWStructuredBuffer<CompressedChristoffel> raised;
+RWStructuredBuffer<CompressedChristoffel> lowered;
+RWStructuredBuffer<CompDerivedConstants> derived;
+
+int globalSeed;
+
+// current
+// sVs
+// Ts
+[numthreads(8, 8, 8)]
+void Derivatives (uint3 id : SV_DispatchThreadID)
+{
+    KAWGiNiBiDerivatives temp1;
+    YijAijDerivatives temp2;
+    
+    YieldSingleDerivatives(current, id, temp1, temp2);
+    sVs[Idx(id)].Compress(temp1, int4(id * 1023 + globalSeed, -globalSeed));
+    Ts[Idx(id)].Compress(temp2, int4(id * 511 + globalSeed, -globalSeed));
+}
+
+// current
+// lowered
+// raised
+// Ts
+[numthreads(14, 13, 5)]
+void ComputeChristoffels(uint3 id : SV_DispatchThreadID)
+{
+    Christoffel upper, lower;
+    upper.Yield(lower, current[Idx(id)].CYUij(), Ts[Idx(id)].Decompress().delYij);
+
+    raised[Idx(id)].Compress(upper);
+    lowered[Idx(id)].Compress(lower);
+}
+
+// current
+// derived
+// lowered
+// raised
+// sVs
+// Ts
+[numthreads(11, 9, 5)]
+void ComputeConformalRicci(uint3 id : SV_DispatchThreadID)
+{
+    float3x3 cyij = current[Idx(id)].cYij.toF3x3();
+    float3x3 cyuij = matInvSymUD(cyij);
+    derived[Idx(id)].W2Rij.Set(ConformalRicciWTensor(CyijLaplacian(Ts, cyuij, id), sVs[Idx(id)].delGi.toF3x3(), cyij, cyuij, lowered[Idx(id)].Decompress(), raised[Idx(id)].Decompress()));
+}
+
+// current
+// raised
+// derived
+// MassCurrent
+// sVs
+[numthreads(8, 8, 8)]
+void ComputeDerived(uint3 id : SV_DispatchThreadID)
+{
+    Voxel vox = current[Idx(id)];
+    Christoffel upper = raised[Idx(id)].Decompress();
+    float3x3 currDerivs = sVs[Idx(id)].delKAW.toF3x3();
+    
+    float3x3 d2A = 0;
+    float3x3 d2W = 0;
+    
+    float3 ddx = 1. / CoordinateMetric(id);
+    int3 offset = int3(id) - clamp(int3(id) - 3, 0, resolution - 7);
+    
+    for (int j = 0; j < 7; j++)
+    {
+        f3x3Comp delX = sVs[Idx(int3(j + id.x - offset.x, id.y, id.z))].delKAW;
+        f3x3Comp delY = sVs[Idx(int3(id.x, j + id.y - offset.y, id.z))].delKAW;
+        f3x3Comp delZ = sVs[Idx(int3(id.x, id.y, j + id.z - offset.z))].delKAW;
+        
+        d2A[0] += cdelO6[j + offset.x * 7] * ddx.x * delX.entries[1].toF3();
+        d2A[1] += cdelO6[j + offset.y * 7] * ddx.y * delY.entries[1].toF3();
+        d2A[2] += cdelO6[j + offset.z * 7] * ddx.z * delZ.entries[1].toF3();
+        
+        d2W[0] += cdelO6[j + offset.x * 7] * ddx.x * delX.entries[2].toF3();
+        d2W[1] += cdelO6[j + offset.y * 7] * ddx.y * delY.entries[2].toF3();
+        d2W[2] += cdelO6[j + offset.z * 7] * ddx.z * delZ.entries[2].toF3();
+    }
+    
+    DerivedConstants consts;
+    float3x3 DmDnW = SecondCovariantDerivativeW(d2W, currDerivs[2], upper);
+    
+    consts.W2Rij = derived[Idx(id)].W2Rij.toF3x3() * vox.W * vox.W + RicciWTensor(currDerivs[2], DmDnW, vox.cYij.toF3x3(), vox.W);
+    consts.W2DmDnA = SecondCovariantDerivativeLapse(d2A, currDerivs[1], currDerivs[2], vox.cYij.toF3x3(), vox.W, upper);
+    consts.H = Trace(consts.W2Rij, vox.CYUij()) + 2. / 3. * vox.K * vox.K - SelfTraceSymmetric(vox.Aij.toF3x3(), vox.CYUij()) - 16. * Pi * MassCurrent[Idx(id)].s - 2. * vacuumEnergy;
+    consts.Gi = current[Idx(id)].Gi - AnalyticGi(upper, vox.CYUij());
+    consts.LaplW = Trace(DmDnW, vox.CYUij());
+    consts.Mi = 0;
+    
+    derived[Idx(id)].Compress(consts);
+}
+
+// current
+// raised
+// derived
+// MassCurrent
+// sVs
+// Ts
+[numthreads(11, 11, 5)]
+void ComputeDerived2(uint3 id : SV_DispatchThreadID)
+{
+    Voxel vox = current[Idx(id)];
+    Christoffel upper = raised[Idx(id)].Decompress();
+    float3x3 currDerivs = sVs[Idx(id)].delKAW.toF3x3();
+    float3x3 cyuij = vox.CYUij();
+    
+    float3x3 delAijs[3] = Ts[Idx(id)].Decompress().delAij;
+    upper.CovariantDerivative(delAijs, vox.Aij.toF3x3());
+    
+    derived[Idx(id)].Mi.Set(mul(cyuij, delAijs[0])[0] + mul(cyuij, delAijs[1])[1] + mul(cyuij, delAijs[2])[2] - 2. / 3. * currDerivs[0] - 3. * mul(vox.Aij.toF3x3(), mul(currDerivs[2], cyuij)) / vox.W - 8. * Pi * MassCurrent[Idx(id)].v.toF3());
+}
