@@ -13,3 +13,7 @@ Further documentation and procedure can be found as part of a PDF included in th
 - `N_06_KO_20_M_080`:  $N = \frac{0.6}{M}$,  $\sigma = 0.2$,  $\kappa_3 = 0.08$
 - `N_06_KO_20_MH_125`:  $N = \frac{0.6}{M}$,  $\sigma = 0.2$,  $\kappa_3 = \kappa_6 = 0.125$
 - `N_06_KO_195_Mi_110_DG_06`:  $N = \frac{0.6}{M}$,  $\sigma = 0.195$,  $\kappa_3 = 0.11$,  $\kappa_5 = 0.06$
+
+### O.M.G. (Ordinary Multi-Grid relaxation)
+- `OMG_Spin`: $N = \frac{0.6}{M}$,  $\sigma = 0.2$,  $\kappa_7 = \kappa_2 = 0.05$,  $\kappa_5 = 0.065$
+- `OMG_Spin_ViewH`: $N = \frac{0.6}{M}$,  $\sigma = 0.2$,  $\kappa_7 = 0.05$,  $\kappa_2 = 0.1$,  $\kappa_5 = 0.075$
