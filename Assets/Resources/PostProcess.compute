@@ -21,8 +21,8 @@ StructuredBuffer<CompressedChristoffel> lowered;
 StructuredBuffer<CompDerivedConstants> derived;
 
 #define assert .75
-#define damp 0.06
-#define KO .195
+#define damp 0.07
+#define KO .2
 
 // current
 // sVs
@@ -136,6 +136,10 @@ void RenderToScreenSlice(uint3 id : SV_DispatchThreadID)
     
     float trueW = next[Idx(coords)].W + smoothLerpW;
     float3 trueNi = smoothLerpNi + next[Idx(coords)].N.xyz;
+    
+    //float3 display = -log10(abs(derived[Idx(coords)].H) + 1E-5) * .25 * Pi;
+    //display = float3(cos(display.x), cos(display.y + Pi * 1.33333333333), cos(display.y - Pi * 1.33333333333)) + .5;
+    //float3 display = derived[Idx(coords)].H * 500. + .5;
     
     float3 display = smoothstep(0.75, 0.85, sin(log(abs(1. - trueW)) * 40.));
     display = lerp(display, smoothstep(0.64, 0.66, trueW) * (0.6 + trueNi / sqrt(length(trueNi) + .01)), .94);

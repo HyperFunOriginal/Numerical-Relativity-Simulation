@@ -1,33 +1,24 @@
 ﻿#include "BSSNHelp.hlsl"
 
-//static const float mass1 = 7;
-//static const float mass2 = 0;
+//static const float mass1 = 4.83; // Bare Mass
+//static const float mass2 = 4.83; // Bare Mass
 
-//static const float3 position1 = float3(0, 0, 0);
-//static const float3 position2 = float3(0, 0, 0);
-//static const float3 momentum1 = float3(0, 0, 0);
-//static const float3 momentum2 = float3(0, 0, 0);
-//static const float3 spin1 = float3(0, 0, 20);
+//static const float3 position1 = float3(-32.57, 0, 0);
+//static const float3 position2 = float3(32.57, 0, 0);
+//static const float3 momentum1 = float3(0, -1.34, 0);
+//static const float3 momentum2 = float3(0, 1.34, 0);
+//static const float3 spin1 = float3(0, 0, 0);
 //static const float3 spin2 = float3(0, 0, 0);
 
-static const float mass1 = 4.83;
-static const float mass2 = 4.83;
+static const float mass1 = 1.764; // Bare Mass
+static const float mass2 = 1.764; // Bare Mass
 
-static const float3 position1 = float3(-32.57, 0, 0);
-static const float3 position2 = float3(32.57, 0, 0);
-static const float3 momentum1 = float3(0, -1.34, 0);
-static const float3 momentum2 = float3(0, 1.34, 0);
-static const float3 spin1 = float3(0, 0, 0);
-static const float3 spin2 = float3(0, 0, 0);
-
-//static const float mass1 = 6;
-//static const float mass2 = 6;
-//static const float3 position1 = float3(-36.9, 0, 0);
-//static const float3 position2 = float3(36.9, 0, 0);
-//static const float3 momentum1 = float3(0, -1.58, 0);
-//static const float3 momentum2 = float3(0, 1.58, 0);
-//static const float3 spin1 = float3(0, 0, 35.5);
-//static const float3 spin2 = float3(0, 0, 35.5);
+static const float3 position1 = float3(-29.66, 0, 0);
+static const float3 position2 = float3(29.66, 0, 0);
+static const float3 momentum1 = float3(0, -1.2616, 0);
+static const float3 momentum2 = float3(0, 1.2616, 0);
+static const float3 spin1 = float3(0, 0, 22.5);
+static const float3 spin2 = float3(0, 0, 22.5);
 
 void YieldBSSNCurvatures(float3x3 Kij, float3x3 cYij, float W, out float K, out Sfloat3x3 Aij)
 {
@@ -61,8 +52,7 @@ float3x3 BowenYorkExtrinsicCurvature(float3 radial, float3 linearMom, float3 spi
     float3x3 res = (PermutedTensorProduct(linearMom, radial) + 0.5 * dot(linearMom, radial) * distortion) / (r * r);
     return 3. * (res + PermutedTensorProduct(cross(spin, radial), radial * 2. / (r * r * r)));
 }
-float BowenYorkConformalFactor(float3 radial, float3 position, float mass)
+float BowenYorkConformalFactor(float3 radial, float mass)
 {
-    radial -= position;
-    return mass * 0.5 * rsqrt(max(0.001, dot(radial, radial) - lengthScale * lengthScale * .05));
+    return mass * 0.5 * rsqrt(max(0.001, dot(radial, radial) - lengthScale * lengthScale * .06));
 }

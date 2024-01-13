@@ -1,6 +1,8 @@
 #pragma kernel Initialize
 #pragma kernel InitKijAlphaU
 #pragma kernel ConstraintSolveBowenYork
+#pragma kernel DownScaleKijAlphaU
+#pragma kernel UpscaleU
 #include "InitialConditions.hlsl"
 
 RWStructuredBuffer<Voxel> old;
@@ -10,49 +12,12 @@ RWStructuredBuffer<Voxel> next;
 RWStructuredBuffer<f4Comp> MassCurrent;
 RWStructuredBuffer<Sf3x3Comp> SpatialStress;
 
+//                    | <- offset        | <- offset |...| <- offset
+// [ 0 0 0 0 0 0 0 0 ... 0 1 1 1 1 1 1 ..... 2 2 2 2 ..... N N N N ... ]
 RWStructuredBuffer<float> uBuffer;
 RWStructuredBuffer<float2> kAlphaBuffer; // Alpha; KijKuij
 
-[numthreads(16, 8, 8)]
-void InitKijAlphaU(uint3 id : SV_DispatchThreadID)
-{
-    uBuffer[Idx(id)] = 1;
-    
-    float3 position = CoordinateTransform(id);
-    float3x3 Kij = BowenYorkExtrinsicCurvature(position - position1, momentum1, spin1);
-    Kij += BowenYorkExtrinsicCurvature(position - position2, momentum2, spin2);
-    
-    kAlphaBuffer[Idx(id)] = float2(BowenYorkConformalFactor(position, position1, mass1) + BowenYorkConformalFactor(position, position2, mass2), Trace(mul(Kij, Kij)));
-}
-
-[numthreads(16, 8, 8)]
-void ConstraintSolveBowenYork(uint3 id : SV_DispatchThreadID)
-{
-    if (EdgeOfDomain(id, 1))
-        return;
-    
-    float2 temp = kAlphaBuffer[Idx(id)];
-    float u = uBuffer[Idx(id)];
-    
-    int3 origin = int3(id);
-    float3 ddx = 1. / CoordinateMetric(origin);
-    ddx *= ddx;
-    int3 offset = origin - clamp(origin - 3, 0, resolution - 7);
-    float lapl = 0;
-    
-    for (int j = 0; j < 7; j++)
-    {
-        lapl += uBuffer[Idx(int3(j + origin.x - offset.x, origin.y, origin.z))] * cdel2O6[j + offset.x * 7] * ddx.x;
-        lapl += uBuffer[Idx(int3(origin.x, j + origin.y - offset.y, origin.z))] * cdel2O6[j + offset.y * 7] * ddx.y;
-        lapl += uBuffer[Idx(int3(origin.x, origin.y, j + origin.z - offset.z))] * cdel2O6[j + offset.z * 7] * ddx.z;
-    }
-    
-    lapl += 0.125 * temp.y * pow(abs(temp.x + u), -7);
-    lapl /= dot(ddx, 1);
-    
-    uBuffer[Idx(id)] = clamp(u + lapl * .33, u * .5, u * 1.5);
-}
-
+int offset;
 [numthreads(16, 8, 8)]
 void Initialize (uint3 id : SV_DispatchThreadID)
 {
@@ -60,12 +25,16 @@ void Initialize (uint3 id : SV_DispatchThreadID)
     SpatialStress[Idx(id)].Set(0);
 
     float3 position = CoordinateTransform(id);
-    float3x3 Kij = BowenYorkExtrinsicCurvature(position - position1, momentum1, spin1);
-    Kij += BowenYorkExtrinsicCurvature(position - position2, momentum2, spin2);
+    float3 r1 = position - position1;
+    float3 r2 = position - position2;
+    
+    float3x3 Kij = BowenYorkExtrinsicCurvature(r1, momentum1, spin1);
+    Kij += BowenYorkExtrinsicCurvature(r2, momentum2, spin2);
+    float xi = BowenYorkConformalFactor(r1, mass1) + BowenYorkConformalFactor(r2, mass2);
     
     Voxel init;
     init.cYij.Set(I3);
-    init.W = pow(uBuffer[Idx(id)] + kAlphaBuffer[Idx(id)].x, -2);
+    init.W = pow(1. + uBuffer[Idx(id) + offset] + xi, -2);
     init.N = float4(0,0,0,1);
     init.K = 0;
     init.Aij.Set(Kij * init.W * init.W * init.W);
@@ -74,4 +43,142 @@ void Initialize (uint3 id : SV_DispatchThreadID)
     old[Idx(id)] = init;
     current[Idx(id)] = init;
     next[Idx(id)] = init;
+}
+
+[numthreads(16, 8, 8)]
+void InitKijAlphaU(uint3 id : SV_DispatchThreadID)
+{
+    float3 position = CoordinateTransform(id);
+    
+    float3 r1 = position - position1;
+    float3 r2 = position - position2;
+    
+    float3x3 Kij = BowenYorkExtrinsicCurvature(r1, momentum1, spin1);
+    Kij += BowenYorkExtrinsicCurvature(r2, momentum2, spin2);
+    
+    float xi = BowenYorkConformalFactor(r1, mass1) + BowenYorkConformalFactor(r2, mass2);
+    float effMass1 = sqrt(mass1 * mass1 + max(dot(momentum1, momentum1) + length(spin1) - 1.8, 0));
+    float effMass2 = sqrt(mass2 * mass2 + max(dot(momentum2, momentum2) + length(spin2) - 1.8, 0));
+    
+    kAlphaBuffer[Idx(id) + offset] = float2(xi, Trace(mul(Kij, Kij)));
+    uBuffer[Idx(id) + offset] = BowenYorkConformalFactor(r1, effMass1) + BowenYorkConformalFactor(r2, effMass2) - xi; // init guess for u
+}
+
+// Multigrid Method
+
+int subresolution;
+int IdxS(int3 coords, int res)
+{
+    int3 clamped = clamp(coords, 0, res - 1) - coords;
+    if (dot(clamped, clamped) != 0)
+        return -214748364;
+    return coords.z * res * res + coords.y * res + coords.x;
+}
+float3 CoordinateTransformS(float3 id, int res)
+{
+    id = (id + .5) * 2. / res - 1.;
+    return log((1. + id) / (1. - id)) * .25 * resolution * lengthScale;
+}
+float3 InverseCoordinateTransformS(float3 position, int res)
+{
+    position /= .5 * resolution * lengthScale;
+    return clamp((tanh(position) + 1.) * .5 * res - .5, 0., res - 1.);
+}
+float3 CoordinateMetricS(float3 id, int res)
+{
+    id = (id + .5) * 2. / res - 1.;
+    float newLengthScale = float(resolution) / float(res);
+    return lengthScale * newLengthScale / (1. - id * id);
+}
+bool EdgeOfDomainS(int3 id, int edgeDist, int res)
+{
+    return dot(abs(clamp(id, edgeDist, res - edgeDist - 1) - id), 1) != 0;
+}
+
+[numthreads(16, 8, 8)]
+void ConstraintSolveBowenYork(uint3 id : SV_DispatchThreadID)
+{
+    if (EdgeOfDomainS(id, 1, subresolution))
+        return;
+    
+    float2 temp = kAlphaBuffer[IdxS(id, subresolution) + offset];
+    float u = uBuffer[IdxS(id, subresolution) + offset];
+    
+    float3 ddx = 1 / CoordinateMetricS(float3(id), subresolution); ddx *= ddx;
+    float lapl = 0.125 * temp.y * pow(abs(1. + temp.x + u), -7);
+    lapl += (uBuffer[IdxS(id + int3(-1, 0, 0), subresolution) + offset] + uBuffer[IdxS(id + int3(1, 0, 0), subresolution) + offset]) * ddx.x;
+    lapl += (uBuffer[IdxS(id + int3(0, -1, 0), subresolution) + offset] + uBuffer[IdxS(id + int3(0, 1, 0), subresolution) + offset]) * ddx.y;
+    lapl += (uBuffer[IdxS(id + int3(0, 0, -1), subresolution) + offset] + uBuffer[IdxS(id + int3(0, 0, 1), subresolution) + offset]) * ddx.z;
+    lapl /= dot(ddx, 2.);
+    lapl -= u;
+    
+    uBuffer[IdxS(id, subresolution) + offset] = clamp(u + lapl, (u - 1.) * .5, (1. + u) * 3.);
+}
+
+int subresolution2; // smaller
+int offset2; // smaller
+[numthreads(16, 8, 8)]
+void DownScaleKijAlphaU(uint3 id : SV_DispatchThreadID)
+{
+    float3 oldPos1 = round(InverseCoordinateTransformS(CoordinateTransformS(float3(id) - 1., subresolution2), subresolution));
+    float3 oldPos2 = round(InverseCoordinateTransformS(CoordinateTransformS(float3(id) + 1., subresolution2), subresolution));
+    float3 oldPos = InverseCoordinateTransformS(CoordinateTransformS(id, subresolution2), subresolution);
+    
+    float3 l000 = float3(kAlphaBuffer[IdxS(int3(round(oldPos)), subresolution) + offset], uBuffer[IdxS(int3(round(oldPos)), subresolution) + offset]);
+    float3 l111 = float3(kAlphaBuffer[IdxS(int3(oldPos1.x, oldPos1.y, oldPos1.z), subresolution) + offset], uBuffer[IdxS(int3(oldPos1.x, oldPos1.y, oldPos1.z), subresolution) + offset]);
+    float3 l211 = float3(kAlphaBuffer[IdxS(int3(oldPos2.x, oldPos1.y, oldPos1.z), subresolution) + offset], uBuffer[IdxS(int3(oldPos2.x, oldPos1.y, oldPos1.z), subresolution) + offset]);
+    float3 l121 = float3(kAlphaBuffer[IdxS(int3(oldPos1.x, oldPos2.y, oldPos1.z), subresolution) + offset], uBuffer[IdxS(int3(oldPos1.x, oldPos2.y, oldPos1.z), subresolution) + offset]);
+    float3 l221 = float3(kAlphaBuffer[IdxS(int3(oldPos2.x, oldPos2.y, oldPos1.z), subresolution) + offset], uBuffer[IdxS(int3(oldPos2.x, oldPos2.y, oldPos1.z), subresolution) + offset]);
+    float3 l112 = float3(kAlphaBuffer[IdxS(int3(oldPos1.x, oldPos1.y, oldPos2.z), subresolution) + offset], uBuffer[IdxS(int3(oldPos1.x, oldPos1.y, oldPos2.z), subresolution) + offset]);
+    float3 l212 = float3(kAlphaBuffer[IdxS(int3(oldPos2.x, oldPos1.y, oldPos2.z), subresolution) + offset], uBuffer[IdxS(int3(oldPos2.x, oldPos1.y, oldPos2.z), subresolution) + offset]);
+    float3 l122 = float3(kAlphaBuffer[IdxS(int3(oldPos1.x, oldPos2.y, oldPos2.z), subresolution) + offset], uBuffer[IdxS(int3(oldPos1.x, oldPos2.y, oldPos2.z), subresolution) + offset]);
+    float3 l222 = float3(kAlphaBuffer[IdxS(int3(oldPos2.x, oldPos2.y, oldPos2.z), subresolution) + offset], uBuffer[IdxS(int3(oldPos2.x, oldPos2.y, oldPos2.z), subresolution) + offset]);
+    oldPos = (oldPos - round(oldPos)) * .5 + .5;
+    
+    l111 = lerp(l111, l211, oldPos.x);
+    l121 = lerp(l121, l221, oldPos.x);
+    l112 = lerp(l112, l212, oldPos.x);
+    l122 = lerp(l122, l222, oldPos.x);
+
+    l111 = lerp(l111, l121, oldPos.y);
+    l112 = lerp(l112, l122, oldPos.y);
+    
+    l111 = lerp(l111, l112, oldPos.z);
+    
+    float newLengthScale = float(subresolution2) / float(subresolution);
+    l111 = lerp(l000, l111, clamp(distance(oldPos, .5) * 2., 1. - newLengthScale * newLengthScale, 1.));
+    
+    kAlphaBuffer[IdxS(id, subresolution2) + offset2] = l111.xy;
+    uBuffer[IdxS(id, subresolution2) + offset2] = l111.z;
+}
+
+[numthreads(16, 8, 8)]
+void UpscaleU(uint3 id : SV_DispatchThreadID)
+{
+    if (EdgeOfDomainS(id, 1, subresolution))
+        return;
+    
+    float3 oldPos = InverseCoordinateTransformS(CoordinateTransformS(id, subresolution), subresolution2);
+    
+    float l111 = uBuffer[IdxS(int3(oldPos), subresolution2) + offset2];
+    float l211 = uBuffer[IdxS(int3(oldPos) + int3(1, 0, 0), subresolution2) + offset2];
+    float l121 = uBuffer[IdxS(int3(oldPos) + int3(0, 1, 0), subresolution2) + offset2];
+    float l221 = uBuffer[IdxS(int3(oldPos) + int3(1, 1, 0), subresolution2) + offset2];
+    float l112 = uBuffer[IdxS(int3(oldPos) + int3(0, 0, 1), subresolution2) + offset2];
+    float l212 = uBuffer[IdxS(int3(oldPos) + int3(1, 0, 1), subresolution2) + offset2];
+    float l122 = uBuffer[IdxS(int3(oldPos) + int3(0, 1, 1), subresolution2) + offset2];
+    float l222 = uBuffer[IdxS(int3(oldPos) + int3(1, 1, 1), subresolution2) + offset2];
+
+    oldPos -= floor(oldPos);
+    l111 = lerp(l111, l211, oldPos.x);
+    l121 = lerp(l121, l221, oldPos.x);
+    l112 = lerp(l112, l212, oldPos.x);
+    l122 = lerp(l122, l222, oldPos.x);
+
+    l111 = lerp(l111, l121, oldPos.y);
+    l112 = lerp(l112, l122, oldPos.y);
+    
+    l111 = lerp(l111, l112, oldPos.z);
+    
+    uBuffer[IdxS(id, subresolution) + offset] = l111;
 }

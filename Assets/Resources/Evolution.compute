@@ -20,12 +20,12 @@ StructuredBuffer<CompressedChristoffel> lowered;
 StructuredBuffer<CompDerivedConstants> derived;
 
 #define kappa1 1. // gi
-#define kappa2 .1 // H; K
-#define kappa3 .11 // Mi; Aij
+#define kappa2 .06 // H; K
+#define kappa3 .1 // Mi; Aij
 #define kappa4 .8 // BG; Yij
-#define kappa5 .06 // DG; Yij
+#define kappa5 .065 // DG; Yij
 #define kappa6 .1 // H; W
-#define kappa7 .1 // H; Aij
+#define kappa7 .06 // H; Aij
 
 // MassCurrent
 // SpatialStress
@@ -52,7 +52,7 @@ void WK(uint3 id : SV_DispatchThreadID)
         dtK += v.K * v.K / 3. - Trace(consts.W2DmDnA.toF3x3(), cyuij) - v.N.w * vacuumEnergy + v.N.w * (SelfTraceSymmetric(v.Aij.toF3x3(), cyuij) + 4. * Pi * (Trace(spatial.toF3x3(), cyuij) * v.W * v.W + MassCurrent[Idx(id)].s));
     
          // Constraint Damping
-        dtW += kappa6 * consts.H * (v.W - consts.LaplW * 5.);
+        dtW += kappa6 * consts.H * (1 - min(consts.LaplW / v.W, 2));
         dtK -= v.N.w * v.K * consts.H * kappa2;
     }
     
@@ -201,11 +201,11 @@ void ConstraintDamp(uint3 id : SV_DispatchThreadID)
         
             CompressedChristoffel christoffelComp = raised[Idx(id)];
             Christoffel uncomp = christoffelComp.Decompress();
+            
             DiMj = uncomp.CovariantDerivative(DiMj, derivedConstants.Mi.toF3(), true);
             DiMj += 3. * TensorProduct(derivedConstants.Mi.toF3(), del.delKAW.entries[2].toF3() / max(.01, v.W));
-            dtY = mul(uncomp.CovariantDerivative(dtY, derivedConstants.Gi.toF3(), false), v.cYij.toF3x3());
-        
-            dtY *= -kappa5;
+            
+            dtY = mul(uncomp.CovariantDerivative(dtY, derivedConstants.Gi.toF3(), false), v.cYij.toF3x3()); dtY *= -kappa5;
             dtY += ContractBoth(TensorProduct(v.N.xyz, derivedConstants.Gi.toF3()), v.cYij.toF3x3()) * kappa4;
             dtY -= float(0.2 * dot(derivedConstants.Gi.toF3(), mul(v.N.xyz, v.cYij.toF3x3()))) * v.cYij.toF3x3();
         }
@@ -214,7 +214,7 @@ void ConstraintDamp(uint3 id : SV_DispatchThreadID)
     
         next[Idx(id)].Gi -= derivedConstants.Gi.toF3() * ((1. + kappa1) * giScale + Bm2AK) * timestep;
         next[Idx(id)].Aij.TermwiseMADS(DiMj, timestep * v.N.w * kappa3);
-        next[Idx(id)].Aij.TermwiseMADS(v.Aij.toF3x3(), timestep * derivedConstants.H * v.N.w * kappa7);
+        next[Idx(id)].Aij.TermwiseMADS(ContractBoth(v.Aij.toF3x3(), v.CYUij()), timestep * derivedConstants.H * v.N.w * kappa7);
         next[Idx(id)].cYij.TermwiseMADS(dtY, timestep);
     }
 }

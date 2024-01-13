@@ -13,6 +13,10 @@ public class SolveRelativity : MonoBehaviour
     public float timestep;
     public float vacuumEnergy;
 
+    [Header("Initialization Properties")]
+    public List<int> multigridResolutions;
+    public List<int> relaxationIterations;
+
     [Header("Frame Saving Properties")]
     public bool saveFrames;
     float simTimer;
@@ -40,6 +44,9 @@ public class SolveRelativity : MonoBehaviour
     ComputeBuffer current; // 21
     ComputeBuffer next; // 21
 
+    // Temporary Buffer
+    ComputeBuffer u;
+
     [Header("Compute Shaders")]
     public ComputeShader precompute;
     public int Derivatives => precompute.FindKernel("Derivatives");
@@ -64,8 +71,10 @@ public class SolveRelativity : MonoBehaviour
     public int KreissOligerZ => postProcess.FindKernel("KreissOligerZ");
 
     public ComputeShader init;
+    public int UpscaleU => init.FindKernel("UpscaleU");
     public int Initialize => init.FindKernel("Initialize");
     public int InitKijAlphaU => init.FindKernel("InitKijAlphaU");
+    public int DownScaleKijAlphaU => init.FindKernel("DownScaleKijAlphaU");
     public int ConstraintSolveBowenYork => init.FindKernel("ConstraintSolveBowenYork");
 
     // Start is called before the first frame update
@@ -79,6 +88,66 @@ public class SolveRelativity : MonoBehaviour
         StartCoroutine(StartAndUpdate());
     }
 
+    IEnumerator InitializePoisson()
+    {
+        multigridResolutions.Add(resolution);
+        List<int> offsets = new List<int>() { 0 };
+
+        for (int i = 0; i < multigridResolutions.Count; i++)
+            offsets.Add(offsets[offsets.Count - 1] + multigridResolutions[i] * multigridResolutions[i] * multigridResolutions[i]);
+
+        u = new ComputeBuffer(offsets[offsets.Count - 1], sizeof(float));
+        ComputeBuffer ak = new ComputeBuffer(offsets[offsets.Count - 1], sizeof(float) * 2);
+
+        init.SetInt("offset", offsets[offsets.Count - 2]);
+        init.SetBuffer(InitKijAlphaU, "uBuffer", u);
+        init.SetBuffer(InitKijAlphaU, "kAlphaBuffer", ak);
+        yield return Dispatch(InitKijAlphaU, init, 16, 8, 8);
+
+        for (int i = multigridResolutions.Count - 1; i > 0; i--)
+        {
+            int oldRes = multigridResolutions[i];
+            int newRes = multigridResolutions[i - 1];
+
+            init.SetInt("subresolution", oldRes);
+            init.SetInt("subresolution2", newRes);
+            init.SetInt("offset", offsets[i]);
+            init.SetInt("offset2", offsets[i - 1]);
+
+            init.SetBuffer(DownScaleKijAlphaU, "uBuffer", u);
+            init.SetBuffer(DownScaleKijAlphaU, "kAlphaBuffer", ak);
+            init.Dispatch(DownScaleKijAlphaU, Mathf.CeilToInt(newRes / 16f), Mathf.CeilToInt(newRes / 8f), Mathf.CeilToInt(newRes / 8f));
+        }
+        for (int i = 0; i < multigridResolutions.Count; i++)
+        {
+            int currentRes = multigridResolutions[i];
+
+            init.SetInt("offset", offsets[i]);
+            init.SetInt("subresolution", currentRes);
+
+            for (int j = 0; j <= relaxationIterations[Mathf.Clamp(i, 0, relaxationIterations.Count - 1)]; j++)
+            {
+                init.SetBuffer(ConstraintSolveBowenYork, "uBuffer", u);
+                init.SetBuffer(ConstraintSolveBowenYork, "kAlphaBuffer", ak);
+                init.Dispatch(ConstraintSolveBowenYork, Mathf.CeilToInt(currentRes / 16f), Mathf.CeilToInt(currentRes / 8f), Mathf.CeilToInt(currentRes / 8f));
+                if (j % (10000 / currentRes) == 0)
+                    yield return null;
+            }
+
+            if (i != multigridResolutions.Count - 1)
+            {
+                init.SetInt("subresolution", multigridResolutions[i + 1]);
+                init.SetInt("subresolution2", currentRes);
+                init.SetInt("offset", offsets[i + 1]);
+                init.SetInt("offset2", offsets[i]);
+
+                init.SetBuffer(UpscaleU, "uBuffer", u);
+                init.Dispatch(UpscaleU, Mathf.CeilToInt(multigridResolutions[i + 1] / 16f), Mathf.CeilToInt(multigridResolutions[i + 1] / 8f), Mathf.CeilToInt(multigridResolutions[i + 1] / 8f));
+            }
+        }
+        ak.Dispose();
+    }
+
     IEnumerator InitialiseVariables()
     {
         directory = Application.dataPath;
@@ -87,27 +156,10 @@ public class SolveRelativity : MonoBehaviour
         logger = new StreamWriter(directory + "Log.log", true);
         logger.AutoFlush = true;
 
-        SetConstants(new Vector3(0,1,1));
-
+        SetConstants(new Vector3(0, 1, 1));
         yield return new WaitForEndOfFrame();
         temp = new RenderTexture(resolution * 10, resolution * 10, 0) { enableRandomWrite = true };
         temp.Create();
-
-        ComputeBuffer u = new ComputeBuffer(voxels, sizeof(float));
-        ComputeBuffer ak = new ComputeBuffer(voxels, sizeof(float) * 2);
-
-        init.SetBuffer(InitKijAlphaU, "uBuffer", u);
-        init.SetBuffer(InitKijAlphaU, "kAlphaBuffer", ak);
-        yield return Dispatch(InitKijAlphaU, init, 16, 8, 8);
-
-        for (int i = 0; i < 2000; i++)
-        {
-            init.SetBuffer(ConstraintSolveBowenYork, "uBuffer", u);
-            init.SetBuffer(ConstraintSolveBowenYork, "kAlphaBuffer", ak);
-            init.Dispatch(ConstraintSolveBowenYork, Mathf.CeilToInt(resolution / 16f), Mathf.CeilToInt(resolution / 8f), Mathf.CeilToInt(resolution / 8f));
-            if (i % 100 == 0)
-                yield return null;
-        }
 
         MassCurrent = new ComputeBuffer(voxels, sizeof(float) * 2);
         SpatialStress = new ComputeBuffer(voxels, sizeof(float) * 2);
@@ -120,11 +172,11 @@ public class SolveRelativity : MonoBehaviour
         raised = new ComputeBuffer(voxels, sizeof(float) * 6);
         lowered = new ComputeBuffer(voxels, sizeof(float) * 6);
         derived = new ComputeBuffer(voxels, sizeof(float) * 9);
-
         initialized = true;
 
+        yield return InitializePoisson();
+
         init.SetBuffer(Initialize, "uBuffer", u);
-        init.SetBuffer(Initialize, "kAlphaBuffer", ak);
         init.SetBuffer(Initialize, "MassCurrent", MassCurrent);
         init.SetBuffer(Initialize, "SpatialStress", SpatialStress);
         init.SetBuffer(Initialize, "old", old);
@@ -133,10 +185,18 @@ public class SolveRelativity : MonoBehaviour
         yield return Dispatch(Initialize, init, 16, 8, 8);
 
         u.Dispose();
-        ak.Dispose();
 
-        string log = "New simulation successfully started! \n\nSimulation Properties: \n  Resolution: " + resolution.ToString() + "\n  Timestep: " + timestep.ToString("f4") + "\n  Base Length Scale: " + lengthScale.ToString("f4") + "\n  Vacuum Energy: " + vacuumEnergy.ToString("f5") + "\n  Domain Size: " + domainSize.ToString("f4");
-        WriteToExternalLog(log + "\n  Saving frames to disk: " + saveFrames.ToString());
+        string log = "New simulation successfully started! \n\nSimulation Properties: \n  Resolution: " + resolution.ToString() + "\n  Timestep: " + timestep.ToString("f4") + "\n  Base Length Scale: " + lengthScale.ToString("f4") + "\n  Vacuum Energy: " + vacuumEnergy.ToString("f5") + "\n  Domain Size: " + domainSize.ToString("f4") + "\n  Saving frames to disk: " + saveFrames.ToString() + "\n\nMultigrid Initialization:\n";
+        for (int i = 0; i < multigridResolutions.Count; i++)
+            log += multigridResolutions[i].ToString() + (i != multigridResolutions.Count - 1 ? ", " : "\n\nRelaxation Iterations: \n");
+        for (int i = 0; i < relaxationIterations.Count; i++)
+            log += relaxationIterations[i].ToString() + (i != relaxationIterations.Count - 1 ? ", " : "\n\nTotal Complexity Score: ");
+
+        float score = voxels / timestep;
+        for (int i = 0; i < multigridResolutions.Count; i++)
+            score += multigridResolutions[i] * multigridResolutions[i] * multigridResolutions[i] * relaxationIterations[Mathf.Clamp(i, 0, relaxationIterations.Count - 1)] * .001f;
+
+        WriteToExternalLog(log + (score * 1E-3f).ToString("f3"));
     }
     void SetConstants(Vector3 ambient)
     {
@@ -223,6 +283,7 @@ public class SolveRelativity : MonoBehaviour
     void ScreenAndIO(ref float timer, ref int imageIndex)
     {
         postProcess.SetTexture(RenderToScreenSlice, "Result", temp);
+        postProcess.SetBuffer(RenderToScreenSlice, "derived", derived);
         postProcess.SetBuffer(RenderToScreenSlice, "sVs", sVs);
         postProcess.SetBuffer(RenderToScreenSlice, "next", next);
         postProcess.Dispatch(RenderToScreenSlice, Mathf.CeilToInt(temp.width / 32f), Mathf.CeilToInt(temp.height / 32f), 1);

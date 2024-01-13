@@ -223,8 +223,10 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   resolution: 159
   lengthScale: 1
-  timestep: 0.19
+  timestep: 0.2
   vacuumEnergy: 0
+  multigridResolutions: 20000000240000002d0000003c000000500000006e000000
+  relaxationIterations: b0040000dc05000008070000dc050000dc050000b0040000f4010000
   saveFrames: 1
   temp: {fileID: 0}
   precompute: {fileID: 7200000, guid: 8a477bfc8ccc73244bd29ca889447e10, type: 3}
